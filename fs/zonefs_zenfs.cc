@@ -168,8 +168,9 @@ IOStatus ZoneFsBackend::Open(bool readonly,
   }
 
   // The size of the "seq" directory shows the number of sequential zones
-  nr_zones_ = zonefs_stat.st_size;
-
+  nr_zones_ =  zonefs_stat.st_size;
+  nr_zones_ = std::min(static_cast<unsigned int>(ZoneNumber), nr_zones_);
+  printf("ZoneFsBackend::Open called nr_zones_=%d\n", nr_zones_);
   seqdirname += "/0";
   int zone_zero_fd = open(seqdirname.c_str(), O_RDONLY);
   if (zone_zero_fd < 0) {

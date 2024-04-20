@@ -1,4 +1,5 @@
 util/zenfs
+util/zenfs.dbg
 fs/*.o
 fs/*.cc.d
 tests/results

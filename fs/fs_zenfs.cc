@@ -16,6 +16,7 @@
 #include <string.h>
 #include <unistd.h>
 
+#include <iostream>
 #include <set>
 #include <sstream>
 #include <utility>
@@ -25,13 +26,31 @@
 #include "metrics_prometheus.h"
 #endif
 #include "rocksdb/utilities/object_registry.h"
+// #include "rocksdb/io_status.h"
+// #include "monitoring/iostats_context_imp.h"
+// #include "monitoring/thread_status_util.h"
+#include "db/db_impl/db_impl.h"
 #include "snapshot.h"
 #include "util/coding.h"
 #include "util/crc32c.h"
+// #include "zbdlib_zenfs.h"
 
 #define DEFAULT_ZENV_LOG_PATH "/tmp/"
 
 namespace ROCKSDB_NAMESPACE {
+
+extern uint64_t GetIOSTATS();
+
+extern bool DoPreCompaction(std::vector<uint64_t> file_list, int ENABLE_LIMIT_LEVEL, int MAX_LIFETIME);
+extern int get_bg_compaction_scheduled_();
+extern void set_write_amplification(double wp);
+extern void set_write_amplification_no_set(double wp);
+extern void set_reset_num(int reset_num);
+extern void set_allocated_num(int allocated_zone_num);
+extern int get_clock();
+
+uint64_t write_size_calc;
+uint64_t write_size_calc_no_reset;
 
 Status Superblock::DecodeFrom(Slice* input) {
   if (input->size() != ENCODED_SIZE) {
@@ -48,6 +67,7 @@ Status Superblock::DecodeFrom(Slice* input) {
   GetFixed32(input, &block_size_);
   GetFixed32(input, &zone_size_);
   GetFixed32(input, &nr_zones_);
+  nr_zones_ = std::min(static_cast<unsigned int>(ZoneNumber), nr_zones_);
   GetFixed32(input, &finish_treshold_);
   memcpy(&aux_fs_path_, input->data(), sizeof(aux_fs_path_));
   input->remove_prefix(sizeof(aux_fs_path_));
@@ -125,10 +145,12 @@ Status Superblock::CompatibleWith(ZonedBlockDevice* zbd) {
                               "Error: block size missmatch");
   if (zone_size_ != (zbd->GetZoneSize() / block_size_))
     return Status::Corruption("ZenFS Superblock", "Error: zone size missmatch");
-  if (nr_zones_ > zbd->GetNrZones())
+  if (nr_zones_ > zbd->GetNrZones()) {
+    printf("DEBUG nr_zones=%d zbd->GetNrZones()=%d\n", nr_zones_,
+           zbd->GetNrZones());
     return Status::Corruption("ZenFS Superblock",
                               "Error: nr of zones missmatch");
-
+  }
   return Status::OK();
 }
 
@@ -269,18 +291,49 @@ ZenFS::~ZenFS() {
   delete zbd_;
 }
 
-void ZenFS::GCWorker() {
+const int SLEEP_TIME = 1000 * 1000;
+int reset_zone_num = 0;
+int allocated_zone_num = 0;
+int pre_compaction_num;
+int precompaction_file_num;
+uint64_t total_file_num = 0;
+uint64_t total_size = 0;
+uint64_t total_extents = 0;
+uint64_t GC_num = 0;
+int case0 = 0, case1 = 0, case2 = 0, case3 = 0, case4 = 0, case5 = 0;
+bool check_gced(std::vector<uint64_t> &file_list, std::map<int64_t, int> &has_migrated) {
+  for(auto &x: file_list) {
+    if((!has_migrated.empty())  && has_migrated.find(x) != has_migrated.end()) {
+      return 1;
+    }
+  }
+  return 0;
+}
+uint64_t pre_fail_id = -1;
+void ZenFS::MyGCWorker() {
+  uint32_t gc_times = 0;
+  uint32_t running = 0;
+  std::map<int64_t, int> has_migrated;
   while (run_gc_worker_) {
-    usleep(1000 * 1000 * 10);
-
+    set_write_amplification(1.0 * write_size_calc / GetIOSTATS());
+    set_write_amplification_no_set(1.0 * write_size_calc_no_reset / GetIOSTATS());
+    set_reset_num(reset_zone_num);
+    set_allocated_num(allocated_zone_num);
+    usleep(SLEEP_TIME);
     uint64_t non_free = zbd_->GetUsedSpace() + zbd_->GetReclaimableSpace();
     uint64_t free = zbd_->GetFreeSpace();
+    printf("Used=%ld Rec=%ld Free=%ld FreePercent=%ld\n", zbd_->GetUsedSpace(), zbd_->GetReclaimableSpace(), zbd_->GetFreeSpace(), (100 * free) / (free + non_free));
     uint64_t free_percent = (100 * free) / (free + non_free);
     ZenFSSnapshot snapshot;
     ZenFSSnapshotOptions options;
-
-    if (free_percent > GC_START_LEVEL) continue;
-
+    if(free_percent > GC_STOP_LEVEL) {
+      if(running) running = 0;
+      continue;
+    }
+    if (free_percent < GC_START_LEVEL && (!running)) {
+      running = 1;
+    }
+    if(!running) continue;
     options.zone_ = 1;
     options.zone_file_ = 1;
     options.log_garbage_ = 1;
@@ -289,16 +342,130 @@ void ZenFS::GCWorker() {
 
     uint64_t threshold = (100 - GC_SLOPE * (GC_START_LEVEL - free_percent));
     std::set<uint64_t> migrate_zones_start;
-    for (const auto& zone : snapshot.zones_) {
-      if (zone.capacity == 0) {
-        uint64_t garbage_percent_approx =
-            100 - 100 * zone.used_capacity / zone.max_capacity;
-        if (garbage_percent_approx > threshold &&
-            garbage_percent_approx < 100) {
-          migrate_zones_start.emplace(zone.start);
+
+    sort(snapshot.zones_.begin(), snapshot.zones_.end(),
+      [](ZoneSnapshot& a, ZoneSnapshot& b) {
+        if (a.capacity == 0 && b.capacity == 0) {
+          return (100 - 100 * a.used_capacity / a.max_capacity) >
+                (100 - 100 * b.used_capacity / b.max_capacity);
+        } else {
+          return a.capacity < b.capacity;
         }
+      });
+
+    // uint64_t greedy_zone_id = 0;
+    std::vector<uint64_t> greedy_zone_id;
+    std::vector<uint64_t> used_cap;
+    std::vector<int> hint_list;
+    std::vector<int> type_list;
+    uint64_t migrate_file_num = 0;
+    uint64_t migrate_size = 0;
+    std::vector<std::vector<uint64_t> > lifetime_list_v;
+    std::vector<std::vector<uint64_t> > prediction_lifetime_list_v;
+    std::vector<std::map<int, int> > hint_num_v;
+
+    printf(
+    "GC Work Start %d threshold=%ld free_percent=%ld  free=%ld non_free=%ld "
+    "GC_START_LEVEL=%ld\n",
+    gc_times, threshold, free_percent, free, non_free, GC_START_LEVEL);
+    uint64_t tot = 0;
+
+    for (const auto& zone : snapshot.zones_) {
+      std::vector<uint64_t>& file_list = zone_file_list[zone.start];
+     // std::vector<std::shared_ptr<ZoneFile>>& file_list_all = zone_file_list_all[zone.start];
+      if (zone.capacity == 0 && zone.lifetime_ != 0) {
+        printf(
+            "zone: zone_start=%ld zone_id=%ld HINT=%d L=%ld R=%ld capacity=%ld "
+            "used_capacity=%ld max_capacity=%ld file_list_size=%ld\n",
+            zone.start, zone.id, zone.lifetime_, zone.min_lifetime, zone.max_lifetime,
+            zone.capacity / MB, zone.used_capacity / MB, zone.max_capacity / MB,
+            file_list.size());
+       
       }
     }
+
+    bool PreCompaction = 0;
+    for (const auto& zone : snapshot.zones_) {
+      std::vector<uint64_t> file_list = zone_file_list[zone.start];
+      std::vector<std::shared_ptr<ZoneFile>>& file_list_all = zone_file_list_all[zone.start];
+
+      if (zone.capacity == 0 && zone.lifetime_ != 0) {
+        
+        migrate_zones_start.emplace(zone.start);
+        
+        bool control_flag;
+       // printf("zone.max_capacity=%ld", zone.max_capacity);
+        if(zone.used_capacity == 0) {
+          printf("Case0 used capactiy = 0 %d\n", ++case0);
+          control_flag = 0;
+
+        } else if(ENABLE_CASE1 && get_bg_compaction_scheduled_() == 0) {
+          printf("Case1 no compaction %d\n", ++case1);
+          control_flag = 1;
+        } else if(ENABLE_CASE2 && check_gced(file_list, has_migrated)) {
+          printf("Case 2 gced before %d\n", ++case2);
+          control_flag = 1;
+        } else if(ENABLE_LIMIT_LEVEL) {
+          printf("Case 5 limit level %d\n", ++case5);
+          control_flag = 1;
+        } else if(1.0 * zone.used_capacity / zone.max_capacity <= GC_THRESHOLD){
+          printf("Case 3 GC %d %lf\n", ++case3, 1.0 * zone.used_capacity / zone.max_capacity);
+          control_flag = 0;
+        } else {
+          printf("Case 4 Compensation %d %lf\n", ++case4, 1.0 * zone.used_capacity / zone.max_capacity);
+          control_flag = 1;
+        }
+        printf("PreCompaction FileList zone_id=%ld pre_zone_id=%ld: ", zone.id, pre_fail_id);
+        for(auto &x: file_list) printf("%ld ", x);
+        puts("");
+        if(ENABLE_PRECOMPACTION && zone.id != pre_fail_id && zone.used_capacity != 0 && file_list.size() != 0 && control_flag == 1) {
+          if( DoPreCompaction(file_list, ENABLE_LIMIT_LEVEL, MAX_LIFETIME)) {
+            pre_compaction_num++;
+            printf("DoPreCompaction %d zone_id=%ld file_list.size()=%ld\n", pre_compaction_num, zone.id, file_list.size());
+            for (auto& x : file_list_all) {
+              ZoneFile& file = *x;
+              printf("file_id=%ld lifetime=%ld\n", file.GetID(), file.new_lifetime);
+            }
+            puts("");
+            migrate_zones_start.emplace(zone.start);
+            PreCompaction = 1;
+            Status s = zbd_->ResetTartetUnusedIOZones(zone.id);
+            if(!s.ok()) {
+              printf("ERROR: ResetZoneIn PreCompaction");
+            }  
+          } else {
+            printf("DoPreCompaction is False\n");
+            migrate_zones_start.emplace(zone.start);
+          }
+          pre_fail_id = zone.id; 
+          printf("Update PreCompaction zone id=%ld\n", pre_fail_id);
+        }
+        zone_file_list[zone.start].clear();
+        zone_file_list_all[zone.start].clear();
+        used_cap.emplace_back(zone.used_capacity / MB);
+        greedy_zone_id.emplace_back(zone.id);
+        lifetime_list_v.emplace_back(zone.lifetime_list);
+        hint_list.emplace_back(zone.lifetime_);
+        type_list.emplace_back(zone.lifetime_type);
+        hint_num_v.emplace_back(zone.hint_num);
+        prediction_lifetime_list_v.emplace_back(zone.prediction_lifetime_list);
+        tot++;
+        if(!PreCompaction) {
+          
+          for(auto &x: file_list) {
+            if((!has_migrated.empty()) && has_migrated.find(x) != has_migrated.end()) {
+              printf("file=%ld has been migrated in time=%d\n", x, has_migrated[x]);
+            } else {
+              has_migrated[x] = gc_times;
+            }
+          }
+          migrate_size += zone.used_capacity;
+          migrate_file_num += file_list.size();
+        }
+        if (tot == K) break;
+      }
+    }
+    if(PreCompaction) continue;
 
     std::vector<ZoneExtentSnapshot*> migrate_exts;
     for (auto& ext : snapshot.extents_) {
@@ -307,14 +474,100 @@ void ZenFS::GCWorker() {
         migrate_exts.push_back(&ext);
       }
     }
+    if (migrate_exts.size() > 0) 
+      GC_num++;
+    if (migrate_zones_start.size() > 0) {
+      printf("GC Begin %d GC=%ld Compensation=%d precompaction_file_num=%d clock=%d ", ++gc_times, GC_num, pre_compaction_num, precompaction_file_num, get_clock());
+      printf(
+          "total_size=%ld free=%ld drive_io=%ld rocks_io=%ld total_extents=%ld total_file_num=%ld zone_size=%ld" 
+          "reset_zone_num=%d migrate_exts=%ld migrate_file_num=%ld migrate_size=%ld case0=%d case1=%d case2=%d case3=%d case4=%d case5=%d\n",
+           total_size / MB, zbd_->GetFreeSpace(), write_size_calc_no_reset, GetIOSTATS(), total_extents, total_file_num, migrate_zones_start.size(), 
+          reset_zone_num, migrate_exts.size(), migrate_file_num, migrate_size / MB, case0, case1, case2, case3, case4, case5);
+
+
+      for(uint64_t i = 0; i < greedy_zone_id.size(); i++) {
+        auto &lifetime_list = lifetime_list_v[i];
+        auto &prediction_lifetime_list = prediction_lifetime_list_v[i];
+        auto &hint_num = hint_num_v[i];
+        std::sort(lifetime_list.begin(), lifetime_list.end());
+        std::sort(prediction_lifetime_list.begin(), prediction_lifetime_list.end());
+
+        if (!lifetime_list.empty()) {
+          printf(
+              "zone_id=%ld diff=%ld HINT=%d type=%d Real_list size=%ld used=%ld min_time=%ld "
+              "max_time=%ld [",
+              greedy_zone_id[i], lifetime_list[lifetime_list.size() - 1] - lifetime_list[0], hint_list[i], type_list[i],
+              lifetime_list.size(), used_cap[i], lifetime_list[0],
+              lifetime_list[lifetime_list.size() - 1]);
+          for (auto& x : lifetime_list) {
+            printf("%ld ", x);
+          }
+          printf("]\n");
+        } else {
+          printf("ERROR: lifetime_list is empty\n");
+        }
+
+        if(MYMODE == true) {
+          if (!prediction_lifetime_list.empty()) {
+            printf(
+                "Zone_id=%ld diff=%ld HINT=%d type=%d Pred_list size=%ld used=%ld min_lifetime=%ld "
+                "max_lifetime=%ld[",
+                greedy_zone_id[i], prediction_lifetime_list[prediction_lifetime_list.size() - 1] -
+                    prediction_lifetime_list[0], hint_list[i], type_list[i], prediction_lifetime_list.size(), used_cap[i],
+                prediction_lifetime_list[0],
+                prediction_lifetime_list[prediction_lifetime_list.size() - 1]);
+            for (auto& x : prediction_lifetime_list) {
+              printf("%ld ", x);
+            }
+            printf("]\n");
+          } else {
+            printf("ERROR: lifetime_list is empty\n");
+          }
+        } else {
+            printf(
+                "Zone_id=%ld diff=%ld HINT=%d Pred_list size=%ld used=%ld\n",
+                greedy_zone_id[i], prediction_lifetime_list[prediction_lifetime_list.size() - 1] -
+                    prediction_lifetime_list[0], hint_list[i], prediction_lifetime_list.size(), used_cap[i]);
+            for (auto& x : hint_num) {
+              printf("key=%d value=%d\n", x.first, x.second);
+            }
+            printf("[");
+            for (auto& x : prediction_lifetime_list) {
+              printf("%ld ", x);
+            }
+            printf("]\n");
+        }
+
+
+      }
+        
+
+
+    }
+
+    if (migrate_exts.size() == 0 && greedy_zone_id.size() != 0) {
+      for(auto &x: greedy_zone_id) {
+        IOStatus s;
+        s = zbd_->ResetTartetUnusedIOZones(x);
+        if (!s.ok()) {
+          Error(logger_, "Garbage collection failed");
+        }
+      }
+    }
 
     if (migrate_exts.size() > 0) {
       IOStatus s;
       Info(logger_, "Garbage collecting %d extents \n",
            (int)migrate_exts.size());
-      s = MigrateExtents(migrate_exts);
+        s = GreedyMigrateExtents(migrate_exts, greedy_zone_id);
+
       if (!s.ok()) {
         Error(logger_, "Garbage collection failed");
+        printf("GC failed");
+      } else {
+        total_file_num += migrate_file_num;
+        total_size += migrate_size;
+        total_extents += migrate_exts.size();
       }
     }
   }
@@ -340,7 +593,6 @@ std::string ZenFS::FormatPathLexically(fs::path filepath) {
 
 void ZenFS::LogFiles() {
   std::map<std::string, std::shared_ptr<ZoneFile>>::iterator it;
-  uint64_t total_size = 0;
 
   Info(logger_, "  Files:\n");
   for (it = files_.begin(); it != files_.end(); it++) {
@@ -577,7 +829,10 @@ IOStatus ZenFS::DeleteFileNoLock(std::string fname, const IOOptions& options,
     } else {
       if (zoneFile->GetNrLinks() > 0) return s;
       /* Mark up the file as deleted so it won't be migrated by GC */
+
       zoneFile->SetDeleted();
+      printf("delete_file_no_lock set_id=%ld is_deleted=%d\n",
+             zoneFile->GetID(), zoneFile->IsDeleted());
       zoneFile.reset();
     }
   } else {
@@ -634,11 +889,85 @@ IOStatus ZenFS::NewWritableFile(const std::string& filename,
                                 const FileOptions& file_opts,
                                 std::unique_ptr<FSWritableFile>* result,
                                 IODebugContext* /*dbg*/) {
+  printf("NewWritableFile Called %s\n", filename.c_str());
   std::string fname = FormatPathLexically(filename);
   Debug(logger_, "New writable file: %s direct: %d\n", fname.c_str(),
         file_opts.use_direct_writes);
 
   return OpenWritableFile(fname, file_opts, result, nullptr, false);
+}
+
+//0 prediction lifetime
+//1 real lifetime
+IOStatus ZenFS::SetFileLifetime(std::string fname, uint64_t lifetime,
+                                int clock, bool flag, int level, std::vector<std::string> overlap_list) {
+  global_clock = clock;
+  const uint64_t MAX = 1e9;
+  if (lifetime > MAX) {
+    lifetime = 0;  //实际上这个可以走WRITE_LIFETIME_HINT
+  }
+  std::string f = FormatPathLexically(fname);
+  if (files_.find(f) == files_.end()) {
+    printf("SetFileLifetime Fail file_name=%s fname=%s lifetime=%ld flag=%d\n",
+           f.c_str(), fname.c_str(), lifetime, flag);
+    return IOStatus::IOError("Can't find file:" + fname);
+  } else {
+
+    std::shared_ptr<ZoneFile> tmp = files_[f];
+     uint64_t lifetime_list_size = 0;
+    if (!flag) {
+      tmp->new_lifetime = lifetime;
+      tmp->new_type = (level <= SHORT_THE) ? 0 : 1;
+      tmp->level = level;
+      if (tmp->GetActiveZone() != NULL) {
+        printf("ERROR: ZoneFile has actived file_id=%ld zone_id=%ld\n",
+               tmp->GetID(), tmp->GetActiveZone()->id);
+      }
+      for(auto &x: overlap_list) {
+        std::string name = FormatPathLexically(x);
+        if(files_.find(name) == files_.end()) {
+          printf("ERROR: can't find overlap file\n");
+          continue;
+        } 
+        std::shared_ptr<ZoneFile> overlap_f_ptr = files_[name];
+        for (auto* zone : zbd_->get_io_zones()) {
+          if (zone->id == overlap_f_ptr->zone_id) {
+            tmp->overlap_zone_list.emplace_back(zone->id);
+
+          }
+        }
+      }
+
+
+    } else {
+    
+      if (tmp->zone_id != 0) {
+        for (auto* zone : zbd_->get_io_zones()) {
+          // printf("zone_information zone_id=%ld zone_capacity=%ld
+          // zone_max_capacity=%ld zone_used_capacity=%ld\n",  zone->id,
+          // zone->capacity_, zone->max_capacity_, zone->used_capacity_.load());
+          if (zone->id == tmp->zone_id) {
+            zone->lifetime_list.emplace_back(lifetime);
+            lifetime_list_size = zone->lifetime_list.size();
+            break;
+          }
+        }
+        if (tmp->GetActiveZone() == NULL) {
+          printf("Flag == 1 But GetActiveZone() is NULL\n");
+        }
+      } else {
+        printf("ERROR: Flag = 1 GetActiveZone is NULL\n");
+      }
+
+    }
+    printf(
+    "SetFileLifetime Success name=%s get_io_zones_size=%ld "
+    "lifetime_list_size=%ld set_zone_id=%ld set_file_id=%ld lifetime=%ld "
+    "flag=%d level=%d over_list.size=%ld new_type=%d\n",
+    f.c_str(), zbd_->get_io_zones().size(), lifetime_list_size,
+    tmp->zone_id, files_[f]->GetID(), lifetime, flag, level, overlap_list.size(), tmp->new_type);
+    return IOStatus::OK();
+  }
 }
 
 IOStatus ZenFS::ReuseWritableFile(const std::string& filename,
@@ -848,11 +1177,12 @@ IOStatus ZenFS::OpenWritableFile(const std::string& filename,
         std::make_shared<ZoneFile>(zbd_, next_file_id_++, &metadata_writer_);
     zoneFile->SetFileModificationTime(time(0));
     zoneFile->AddLinkName(fname);
-
+    zoneFile->debug_fname = fname;
     /* RocksDB does not set the right io type(!)*/
     if (ends_with(fname, ".log")) {
       zoneFile->SetIOType(IOType::kWAL);
       zoneFile->SetSparse(!file_opts.use_direct_writes);
+      zoneFile->new_type = (SHORT_THE == -1) ? 1 : 0;
     } else {
       zoneFile->SetIOType(IOType::kUnknown);
     }
@@ -880,6 +1210,12 @@ IOStatus ZenFS::DeleteFile(const std::string& fname, const IOOptions& options,
   IOStatus s;
 
   Debug(logger_, "DeleteFile: %s \n", fname.c_str());
+  std::string f = FormatPathLexically(fname);
+  printf("delete file called %s %s\n", fname.c_str(), f.c_str());
+
+  if (files_.find(f) != files_.end() && files_[f].get() != nullptr) {
+    printf("file_delete_id=%ld\n", files_[f]->GetID());
+  }
 
   files_mtx_.lock();
   s = DeleteFileNoLock(fname, options, dbg);
@@ -1479,11 +1815,11 @@ Status ZenFS::Mount(bool readonly) {
     if (!status.ok()) return status;
     Info(logger_, "  Done");
 
-    if (superblock_->IsGCEnabled()) {
-      Info(logger_, "Starting garbage collection worker");
-      run_gc_worker_ = true;
-      gc_worker_.reset(new std::thread(&ZenFS::GCWorker, this));
-    }
+    // if (superblock_->IsGCEnabled()) {
+    Info(logger_, "Starting garbage collection worker");
+    run_gc_worker_ = true;
+    gc_worker_.reset(new std::thread(&ZenFS::MyGCWorker, this));
+    //}
   }
 
   LogFiles();
@@ -1566,7 +1902,7 @@ std::map<std::string, Env::WriteLifeTimeHint> ZenFS::GetWriteLifeTimeHints() {
   return hint_map;
 }
 
-#if !defined(NDEBUG) || defined(WITH_TERARKDB)
+//#if !defined(NDEBUG) || defined(WITH_TERARKDB)
 static std::string GetLogFilename(std::string bdev) {
   std::ostringstream ss;
   time_t t = time(0);
@@ -1578,7 +1914,7 @@ static std::string GetLogFilename(std::string bdev) {
 
   return ss.str();
 }
-#endif
+//#endif
 
 Status NewZenFS(FileSystem** fs, const std::string& bdevname,
                 std::shared_ptr<ZenFSMetrics> metrics) {
@@ -1596,17 +1932,17 @@ Status NewZenFS(FileSystem** fs, const ZbdBackendType backend_type,
   //
   // TODO(guokuankuan@bytedance.com) We need to figure out how to reuse
   // RocksDB's logger in the future.
-#if !defined(NDEBUG) || defined(WITH_TERARKDB)
+  //#if !defined(NDEBUG) || defined(WITH_TERARKDB)
   s = Env::Default()->NewLogger(GetLogFilename(backend_name), &logger);
   if (!s.ok()) {
     fprintf(stderr, "ZenFS: Could not create logger");
   } else {
     logger->SetInfoLogLevel(DEBUG_LEVEL);
-#ifdef WITH_TERARKDB
+    //#ifdef WITH_TERARKDB
     logger->SetInfoLogLevel(INFO_LEVEL);
-#endif
+    //#endif
   }
-#endif
+  //#endif
 
   ZonedBlockDevice* zbd =
       new ZonedBlockDevice(backend_name, backend_type, logger, metrics);
@@ -1714,16 +2050,42 @@ void ZenFS::GetZenFSSnapshot(ZenFSSnapshot& snapshot,
   if (options.zone_) {
     zbd_->GetZoneSnapshot(snapshot.zones_);
   }
+
+  zone_file_list.clear();
+  zone_file_list_all.clear();
   if (options.zone_file_) {
     std::lock_guard<std::mutex> file_lock(files_mtx_);
+
     for (const auto& file_it : files_) {
       ZoneFile& file = *(file_it.second);
+
+      // if(file.GetActiveZone() != nullptr) {
+
+      //   printf("file.GetActiveZone() is not nullptr address=%ld file_id=%ld
+      //   zone_id=%ld zone_start=%ld\n",
+      //         &file, file.GetID(), file.GetActiveZone()->id,
+      //         file.zone_begin);
+      // } else {
+      //   if(file.GetZbd() == nullptr) {
+      //     printf("file.GetZbd() is also null");
+      //   }
+      //   printf("file.GetActiveZone() is nullptr address=%ld file_id=%ld
+      //   is_deleted=%d is_openwr=%d new_lifetime=%ld file_size=%ld\n", &file,
+      //   file.GetID(), file.IsDeleted(), file.IsOpenForWR(),
+      //   file.new_lifetime, file.zone_begin);
+      // }
 
       /* Skip files open for writing, as extents are being updated */
       if (!file.TryAcquireWRLock()) continue;
 
-      // file -> extents mapping
+      zone_file_list[file.zone_begin].emplace_back(file.GetID() - 7);
+      zone_file_list_all[file.zone_begin].emplace_back(file_it.second);
+      // printf("file_information migrate_file_id=%ld is_deleted=%d is_openwr=%d
+      // zone_begin=%ld zone_id=%ld\n",  file.GetID(), file.IsDeleted(),
+      // file.IsOpenForWR(), file.zone_begin, file.zone_id);
+      //  file -> extents mapping
       snapshot.zone_files_.emplace_back(file);
+
       // extent -> file mapping
       for (auto* ext : file.GetExtents()) {
         snapshot.extents_.emplace_back(*ext, file.GetFilename());
@@ -1731,6 +2093,8 @@ void ZenFS::GetZenFSSnapshot(ZenFSSnapshot& snapshot,
 
       file.ReleaseWRLock();
     }
+    printf("All files number=%ld zone_files_=%ld has_actived_zone_size=%ld\n",
+           files_.size(), snapshot.zone_files_.size(), zone_file_list.size());
   }
 
   if (options.trigger_report_) {
@@ -1758,7 +2122,30 @@ IOStatus ZenFS::MigrateExtents(
   for (const auto& it : file_extents) {
     s = MigrateFileExtents(it.first, it.second);
     if (!s.ok()) break;
-    s = zbd_->ResetUnusedIOZones();
+    s = zbd_->MyResetUnusedIOZones();
+    if (!s.ok()) break;
+  }
+  return s;
+}
+IOStatus ZenFS::GreedyMigrateExtents(
+    const std::vector<ZoneExtentSnapshot*>& extents, std::vector<uint64_t> zone_id) {
+  IOStatus s;
+  // Group extents by their filename
+  std::map<std::string, std::vector<ZoneExtentSnapshot*>> file_extents;
+  for (auto* ext : extents) {
+    std::string fname = ext->filename;
+    // We only migrate SST file extents
+    if (ends_with(fname, ".sst")) {
+      file_extents[fname].emplace_back(ext);
+    }
+  }
+
+  for (const auto& it : file_extents) {
+    s = MigrateFileExtents(it.first, it.second);
+    if (!s.ok()) break;
+  }
+  for(auto &x: zone_id) {
+    s = zbd_ -> ResetTartetUnusedIOZones(x);
     if (!s.ok()) break;
   }
   return s;
@@ -1806,9 +2193,14 @@ IOStatus ZenFS::MigrateFileExtents(
 
     Zone* target_zone = nullptr;
 
+
+
+
+
+
     // Allocate a new migration zone.
     s = zbd_->TakeMigrateZone(&target_zone, zfile->GetWriteLifeTimeHint(),
-                              ext->length_);
+                              ext->length_, zfile->new_lifetime, zfile->new_type);
     if (!s.ok()) {
       continue;
     }

@@ -103,9 +103,10 @@ IOStatus ZbdlibBackend::Open(bool readonly, bool exclusive,
 
   block_sz_ = info.pblock_size;
   zone_sz_ = info.zone_size;
-  nr_zones_ = info.nr_zones;
+  nr_zones_ = std::min(static_cast<unsigned int>(ZoneNumber), info.nr_zones);
   *max_active_zones = info.max_nr_active_zones;
   *max_open_zones = info.max_nr_open_zones;
+  printf("device information block_sz=%d zone_sz=%ld nr_zones=%d mac_active_zones=%d max_open_zones=%d\n", block_sz_, zone_sz_, nr_zones_, *max_active_zones, *max_open_zones);
   return IOStatus::OK();
 }
 
@@ -116,6 +117,7 @@ std::unique_ptr<ZoneList> ZbdlibBackend::ListZones() {
 
   ret = zbd_list_zones(read_f_, 0, zone_sz_ * nr_zones_, ZBD_RO_ALL,
                        (struct zbd_zone **)&zones, &nr_zones);
+  nr_zones = std::min(static_cast<unsigned int> (ZoneNumber), nr_zones);
   if (ret) {
     return nullptr;
   }
@@ -125,6 +127,7 @@ std::unique_ptr<ZoneList> ZbdlibBackend::ListZones() {
   return zl;
 }
 
+//Reset操作非常重要
 IOStatus ZbdlibBackend::Reset(uint64_t start, bool *offline,
                               uint64_t *max_capacity) {
   unsigned int report = 1;
@@ -172,6 +175,9 @@ int ZbdlibBackend::Read(char *buf, int size, uint64_t pos, bool direct) {
 }
 
 int ZbdlibBackend::Write(char *data, uint32_t size, uint64_t pos) {
+  write_size_calc += size;
+  write_size_calc_no_reset += size;
+
   return pwrite(write_f_, data, size, pos);
 }
 

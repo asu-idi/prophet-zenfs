@@ -777,7 +777,7 @@ int zenfs_tool_fsinfo() {
 }  // namespace ROCKSDB_NAMESPACE
 
 int main(int argc, char **argv) {
-  gflags::SetUsageMessage(
+  google::SetUsageMessage(
       std::string("\nUSAGE:\n") + argv[0] +
       +" <command> [OPTIONS]...\nCommands: mkfs, list, ls-uuid, " +
       +"df, backup, restore, dump, fs-info, link, delete, rename, rmdir");
@@ -789,9 +789,9 @@ int main(int argc, char **argv) {
     return 1;
   }
 
-  gflags::SetVersionString(ZENFS_VERSION);
+  google::SetVersionString(ZENFS_VERSION);
   std::string subcmd(argv[1]);
-  gflags::ParseCommandLineFlags(&argc, &argv, true);
+  google::ParseCommandLineFlags(&argc, &argv, true);
 
   if (FLAGS_zonefs.empty() && FLAGS_zbd.empty() && subcmd != "ls-uuid") {
     fprintf(

@@ -50,14 +50,30 @@ class ZoneSnapshot {
   uint64_t capacity;
   uint64_t used_capacity;
   uint64_t max_capacity;
-
+  uint64_t id;
+  uint64_t min_lifetime;
+  uint64_t max_lifetime;
+  std::vector<uint64_t> lifetime_list;
+  std::vector<uint64_t> prediction_lifetime_list;
+  int lifetime_;
+  std::map<int, int> hint_num;
+  int lifetime_type;
  public:
   ZoneSnapshot(const Zone& zone)
       : start(zone.start_),
         wp(zone.wp_),
         capacity(zone.capacity_),
         used_capacity(zone.used_capacity_),
-        max_capacity(zone.max_capacity_) {}
+        max_capacity(zone.max_capacity_),
+        id(zone.id),
+        min_lifetime(zone.min_lifetime),
+        max_lifetime(zone.max_lifetime), 
+        lifetime_list(zone.lifetime_list),
+        prediction_lifetime_list(zone.prediction_lifetime_list),
+        lifetime_(zone.lifetime_),
+        hint_num(zone.hint_num),
+        lifetime_type(zone.lifetime_type)
+        {}
 };
 
 class ZoneExtentSnapshot {

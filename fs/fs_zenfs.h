@@ -28,6 +28,9 @@ namespace fs = std::filesystem;
 
 namespace ROCKSDB_NAMESPACE {
 
+extern int global_clock;
+
+
 #if !defined(ROCKSDB_LITE) && defined(OS_LINUX)
 
 class ZoneSnapshot;
@@ -62,6 +65,7 @@ class Superblock {
    */
   Superblock(ZonedBlockDevice* zbd, std::string aux_fs_path = "",
              uint32_t finish_threshold = 0, bool enable_gc = false) {
+              
     std::string uuid = Env::Default()->GenerateUniqueId();
     int uuid_len =
         std::min(uuid.length(),
@@ -76,8 +80,9 @@ class Superblock {
 
     block_size_ = zbd->GetBlockSize();
     zone_size_ = zbd->GetZoneSize() / block_size_;
-    nr_zones_ = zbd->GetNrZones();
 
+    nr_zones_ = zbd->GetNrZones();
+    printf("DEBUG zbd->GetNrZones() called %d\n", nr_zones_);
     strncpy(aux_fs_path_, aux_fs_path.c_str(), sizeof(aux_fs_path_) - 1);
 
     std::string zenfs_version = ZENFS_VERSION;
@@ -138,6 +143,8 @@ class ZenFS : public FileSystemWrapper {
   std::mutex files_mtx_;
   std::shared_ptr<Logger> logger_;
   std::atomic<uint64_t> next_file_id_;
+  std::map<uint64_t, std::vector<uint64_t> >zone_file_list; //zone_begin -> file_id
+  std::map<uint64_t, std::vector<std::shared_ptr<ZoneFile>>> zone_file_list_all; //zone_begin -> file
 
   Zone* cur_meta_zone_ = nullptr;
   std::unique_ptr<ZenMetaLog> meta_log_;
@@ -147,7 +154,7 @@ class ZenFS : public FileSystemWrapper {
   std::shared_ptr<Logger> GetLogger() { return logger_; }
 
   std::unique_ptr<std::thread> gc_worker_ = nullptr;
-  bool run_gc_worker_ = false;
+  bool run_gc_worker_ = true;
 
   struct ZenFSMetadataWriter : public MetadataWriter {
     ZenFS* zenFS;
@@ -303,6 +310,8 @@ class ZenFS : public FileSystemWrapper {
                                    const FileOptions& file_opts,
                                    std::unique_ptr<FSWritableFile>* result,
                                    IODebugContext* dbg) override;
+  virtual IOStatus SetFileLifetime(std::string fname, 
+                                   uint64_t lifetime, int clock, bool flag, int level, std::vector<std::string> overlap_list);
   virtual IOStatus ReuseWritableFile(const std::string& fname,
                                      const std::string& old_fname,
                                      const FileOptions& file_opts,
@@ -452,16 +461,16 @@ class ZenFS : public FileSystemWrapper {
                         const ZenFSSnapshotOptions& options);
 
   IOStatus MigrateExtents(const std::vector<ZoneExtentSnapshot*>& extents);
+  IOStatus GreedyMigrateExtents(const std::vector<ZoneExtentSnapshot*>& extents, std::vector<uint64_t>zone_id);
+  
 
   IOStatus MigrateFileExtents(
       const std::string& fname,
       const std::vector<ZoneExtentSnapshot*>& migrate_exts);
 
  private:
-  const uint64_t GC_START_LEVEL =
-      20;                      /* Enable GC when < 20% free space available */
   const uint64_t GC_SLOPE = 3; /* GC agressiveness */
-  void GCWorker();
+  void MyGCWorker();
 };
 #endif  // !defined(ROCKSDB_LITE) && defined(OS_LINUX)
 

@@ -18,7 +18,10 @@
 #include <sys/ioctl.h>
 #include <sys/stat.h>
 #include <unistd.h>
-
+#include <execinfo.h>
+#include <stdio.h>
+#include <stdlib.h>
+ 
 #include <iostream>
 #include <string>
 #include <utility>
@@ -28,6 +31,10 @@
 #include "util/coding.h"
 
 namespace ROCKSDB_NAMESPACE {
+
+extern uint64_t write_size_calc;
+extern uint64_t write_size_calc_no_reset;
+
 
 ZoneExtent::ZoneExtent(uint64_t start, uint64_t length, Zone* zone)
     : start_(start), length_(length), zone_(zone) {}
@@ -261,11 +268,24 @@ void ZoneFile::ClearExtents() {
   }
   extents_.clear();
 }
-
+void print_stacktrace()
+{
+    int size = 16;
+    void * array[16];
+    int stack_num = backtrace(array, size);
+    char ** stacktrace = backtrace_symbols(array, stack_num);
+    for (int i = 0; i < stack_num; ++i)
+    {
+        printf("%s\n", stacktrace[i]);
+    }
+    free(stacktrace);
+}
 IOStatus ZoneFile::CloseActiveZone() {
   IOStatus s = IOStatus::OK();
   if (active_zone_) {
     bool full = active_zone_->IsFull();
+   // print_stacktrace();
+    printf("close_active_zone_id=%ld capacity=%ld\n", active_zone_->id, active_zone_->capacity_);
     s = active_zone_->Close();
     ReleaseActiveZone();
     if (!s.ok()) {
@@ -305,6 +325,8 @@ IOStatus ZoneFile::CloseWR() {
   s = PersistMetadata();
   if (!s.ok()) return s;
   ReleaseWRLock();
+  if(active_zone_ != nullptr)
+    printf("CloseWR zone_id=%ld predict_list_size=%ld extents_size=%ld\n", active_zone_->id, active_zone_->prediction_lifetime_list.size(), extents_.size());
   return CloseActiveZone();
 }
 
@@ -434,15 +456,29 @@ void ZoneFile::PushExtent() {
   extent_filepos_ = file_size_;
 }
 
+
+uint64_t max_global_clock = 0;
 IOStatus ZoneFile::AllocateNewZone() {
   Zone* zone;
-  IOStatus s = zbd_->AllocateIOZone(lifetime_, io_type_, &zone);
+  IOStatus s;
 
+  if(new_lifetime == 0) {
+    new_lifetime = max_global_clock;
+  } else {
+    max_global_clock = std::max(max_global_clock, new_lifetime);
+  }
+  printf("Begin Allocate file_id=%ld HINT=%d new_lifetime=%ld new_type=%d\n", file_id_, lifetime_, new_lifetime, new_type);
+    s = zbd_->AllocateIOZone(lifetime_, io_type_, &zone, new_lifetime, new_type, overlap_zone_list, level); //my_allocate_alogortihm
   if (!s.ok()) return s;
   if (!zone) {
     return IOStatus::NoSpace("Zone allocation failure\n");
   }
   SetActiveZone(zone);
+  zone_begin = zone->start_;
+  zone_id = zone->id;
+  printf("Allocate Result file_name=%s file_hint=%d io_zone_number=%ld allocate_file_id=%ld zone_id=%ld zone_hint=%d lifetime=%ld min_lifetime=%ld max_lifetime=%ld zone_left=%ld\n", 
+    debug_fname.c_str(), lifetime_, GetZbd()->GetIOZones().size(), GetID(), GetActiveZone()->id, zone->lifetime_, new_lifetime, zone->min_lifetime, zone->max_lifetime, zone->GetCapacityLeft());
+  
   extent_start_ = active_zone_->wp_;
   extent_filepos_ = file_size_;
 
@@ -490,6 +526,7 @@ IOStatus ZoneFile::BufferedAppend(char* buffer, uint32_t data_size) {
     left -= extent_length;
 
     if (active_zone_->capacity_ == 0) {
+      printf("BufferAppend::active_zone_full zone_id=%ld predict_list_size=%ld extents_size=%ld\n", active_zone_->id, active_zone_->prediction_lifetime_list.size(), extents_.size());
       s = CloseActiveZone();
       if (!s.ok()) {
         return s;
@@ -548,6 +585,7 @@ IOStatus ZoneFile::SparseAppend(char* sparse_buffer, uint32_t data_size) {
     left -= extent_length;
 
     if (active_zone_->capacity_ == 0) {
+      printf("SparseAppend::active_zone_full zone_id=%ld predict_list_size=%ld extents_size=%ld\n", active_zone_->id, active_zone_->prediction_lifetime_list.size(), extents_.size());
       s = CloseActiveZone();
       if (!s.ok()) {
         return s;
@@ -576,9 +614,11 @@ IOStatus ZoneFile::Append(void* data, int data_size) {
   }
 
   while (left) {
-    if (active_zone_->capacity_ == 0) {
+    printf("Before::Append active_zone_id=%ld zone_capactiy=%ld left=%d file_id=%ld file_size=%ld\n", active_zone_->id, active_zone_->capacity_, left, file_id_, file_size_);
+    if (active_zone_->capacity_ == 0) { //这个地方很重要，既然capacity = 0，肯定就要allocate new zone
+      
       PushExtent();
-
+      printf("Append::active_zone_full_zone_id=%ld predict_list_size=%ld extents_size=%ld\n", active_zone_->id, active_zone_->prediction_lifetime_list.size(), extents_.size());
       s = CloseActiveZone();
       if (!s.ok()) {
         return s;
@@ -587,7 +627,6 @@ IOStatus ZoneFile::Append(void* data, int data_size) {
       s = AllocateNewZone();
       if (!s.ok()) return s;
     }
-
     wr_size = left;
     if (wr_size > active_zone_->capacity_) wr_size = active_zone_->capacity_;
 
@@ -596,6 +635,7 @@ IOStatus ZoneFile::Append(void* data, int data_size) {
 
     file_size_ += wr_size;
     left -= wr_size;
+    printf("After::Append active_zone_id=%ld zone_capacity=%ld left=%d file_id=%ld file_size=%ld\n", active_zone_->id, active_zone_->capacity_, left, file_id_, file_size_);
     offset += wr_size;
   }
 
@@ -699,8 +739,8 @@ IOStatus ZoneFile::Recover() {
 }
 
 void ZoneFile::ReplaceExtentList(std::vector<ZoneExtent*> new_list) {
-  assert(!IsOpenForWR() && new_list.size() > 0);
-  assert(new_list.size() == extents_.size());
+
+  assert(IsOpenForWR() && new_list.size() > 0);
 
   WriteLock lck(this);
   extents_ = new_list;
@@ -739,7 +779,7 @@ IOStatus ZoneFile::SetWriteLifeTimeHint(Env::WriteLifeTimeHint lifetime) {
 
 void ZoneFile::ReleaseActiveZone() {
   assert(active_zone_ != nullptr);
-  bool ok = active_zone_->Release();
+  bool ok = active_zone_->Release(); //release只修改了一个bool变量的值
   assert(ok);
   (void)ok;
   active_zone_ = nullptr;
@@ -749,8 +789,11 @@ void ZoneFile::SetActiveZone(Zone* zone) {
   assert(active_zone_ == nullptr);
   assert(zone->IsBusy());
   active_zone_ = zone;
+  zone->files_id.emplace_back(GetID());
 }
 
+//ZonedWritableFile是返回给Rocksdb的对象
+//其和ZoneFile一一对应
 ZonedWritableFile::ZonedWritableFile(ZonedBlockDevice* zbd, bool _buffered,
                                      std::shared_ptr<ZoneFile> zoneFile) {
   assert(zoneFile->IsOpenForWR());
@@ -1037,6 +1080,7 @@ IOStatus ZonedRandomAccessFile::Read(uint64_t offset, size_t n,
   return zoneFile_->PositionedRead(offset, n, result, scratch, direct_);
 }
 
+//逻辑就是先Read出来，然后target_zone.append
 IOStatus ZoneFile::MigrateData(uint64_t offset, uint32_t length,
                                Zone* target_zone) {
   uint32_t step = 128 << 10;

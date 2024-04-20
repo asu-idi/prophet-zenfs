@@ -165,6 +165,9 @@ struct ZenFSMetricsLatencyGuard {
 
   virtual ~ZenFSMetricsLatencyGuard() {
     uint64_t end_time_micro_ = GetTime();
+    if(end_time_micro_ < begin_time_micro_) {
+      printf("end_time_micro_=%ld < begin_time_micro_=%ld\n", end_time_micro_, begin_time_micro_);
+    }
     assert(end_time_micro_ >= begin_time_micro_);
     metrics_->ReportLatency(label_,
                             Report(end_time_micro_ - begin_time_micro_));

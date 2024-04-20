@@ -17,6 +17,9 @@
 
 namespace ROCKSDB_NAMESPACE {
 
+extern uint64_t write_size_calc;
+extern uint64_t write_size_calc_no_reset;
+
 class ZbdlibBackend : public ZonedBlockDeviceBackend {
  private:
   std::string filename_;
@@ -25,13 +28,13 @@ class ZbdlibBackend : public ZonedBlockDeviceBackend {
   int write_f_;
 
  public:
+  
   explicit ZbdlibBackend(std::string bdevname);
   ~ZbdlibBackend() {
     zbd_close(read_f_);
     zbd_close(read_direct_f_);
     zbd_close(write_f_);
   }
-
   IOStatus Open(bool readonly, bool exclusive, unsigned int *max_active_zones,
                 unsigned int *max_open_zones);
   std::unique_ptr<ZoneList> ListZones();
